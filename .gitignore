@@ -148,3 +148,5 @@ core.*
 
 # Allow
 !src/evaluation/misc/results_dbs/*
+
+./pretrained_weights/
