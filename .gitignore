@@ -150,3 +150,7 @@ core.*
 !src/evaluation/misc/results_dbs/*
 
 ./pretrained_weights/
+./datapath/
+./mine_task/
+./medical_data_lmdb/
+./relys
