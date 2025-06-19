@@ -7,8 +7,10 @@ import base64
 import random
 
 import lmdb
+import h5py
 import pickle
 import logging
+import warnings
 
 import torch
 import numpy as np
@@ -125,14 +127,14 @@ class LMDBDataset(Dataset):
 
 
 def cns5(x):
-            if 'glioblastoma' in x:
-                return 'glioblastoma'
-            elif 'astrocytoma' in x:
-                return 'astrocytoma'
-            elif 'oligodendroglioma' in x:
-                return 'oligodendroglioma'
-            else:
-                return None
+    if 'glioblastoma' in x:
+        return 'glioblastoma'
+    elif 'astrocytoma' in x:
+        return 'astrocytoma'
+    elif 'oligodendroglioma' in x:
+        return 'oligodendroglioma'
+    else:
+        return None
 
 
 def idh(x):
@@ -204,15 +206,17 @@ def random_sample_images(sequences, N, target_size=(224, 224)):
 
 
 class MineDataset(Dataset):
-    def __init__(self, mri_lmdb_dir, split="val", max_txt_length=64, use_augment=False, resolution=224, 
+    def __init__(self, mri_lmdb_dir, split="val", max_txt_length=None, use_augment=False, resolution=224, 
                  transform_3d=None, transform_2d=None, us_root_dir=None,
-                 train_ratio=0.85, us_N=2, us_target_size=(256, 256), mri_targetsize=(64, 64, 64), seed=42, batch_size=4):
+                 train_ratio=0.85, us_N=2, us_target_size=(256, 256), mri_targetsize=(64, 64, 64), seed=42, batch_size=4, use_wsi_coord=False, id_files=None):
         super(MineDataset, self).__init__()
         # self.mri_ids = self.get_mri_ids(mri_lmdb_dir)
         # self.mri_ids = os.listdir('/database/wuyonghuang/WSA/mine_task/MRI_link'); self.mri_ids.sort()
         self.mri_lmdb_dir = mri_lmdb_dir
 
-        cat_ids = pd.read_excel('/database/wuyonghuang/WSA/mine_task/three_modality.xlsx', sheet_name='Sheet2')
+        if id_files is not None:
+            cat_ids = pd.read_excel(id_files, sheet_name='Sheet2')
+        else: raise ValueError
         # note: 去掉 WN22-00234，修改 Li Liping 为 Li liping
         cat_ids = cat_ids[~(cat_ids['wsi'] == 'WN22-00234')]
 
@@ -227,6 +231,7 @@ class MineDataset(Dataset):
         self.us_target_size = us_target_size
         self.mri_targetsize = mri_targetsize
         self.batch_size = batch_size
+        self.use_wsi_coord = use_wsi_coord
         
         self.cat_ids = self.cat_ids.sample(frac=1, random_state=seed)
         if split == 'train':
@@ -235,7 +240,7 @@ class MineDataset(Dataset):
             self.cat_ids = self.cat_ids[self.train_len:]
         else: raise ValueError
 
-        if transform_3d is 'default':
+        if transform_3d == 'default':
             transform_3d = Compose([
                                 # LoadImaged(keys=['image']),
                                 # EnsureChannelFirstd(keys=['image']),  # 将数据转换为 (C, D, H, W)，其中 C=1
@@ -247,12 +252,14 @@ class MineDataset(Dataset):
                                 RandGaussianNoised(keys=['image'], prob=0.5, mean=0.0, std=0.1)  # 随机噪声
                             ])
             
-        if transform_2d is 'default':
+        if transform_2d == 'default':
             transform_2d = None
 
         self.transform_3d = transform_3d
         self.transform_2d = transform_2d
-        self.max_txt_length = max_txt_length
+        # self.max_txt_length = max_txt_length
+        if max_txt_length is not None:
+            warnings.warn("max_txt_length is deprecated and the text will be directly returned without any processing.")
 
         # 超声
         self.us_root_dir = us_root_dir
@@ -272,17 +279,12 @@ class MineDataset(Dataset):
         df = pd.read_excel('/database/wuyonghuang/WSA/mine_task/US-MRI-WSI-TEXT-huashan20240226.xlsx', header=1)
         df['tumorcls3'] = df['CNS5分类'].apply(cns5)
         df['idh'] = df['CNS5分类'].apply(idh)
-        # TODO 增加整合三分类的类别
+
         self.df = df[['病人姓名', 'tumorcls3','idh', '1p/19q']].set_index('病人姓名')
 
     def open_lmdb(self):
         self.env = lmdb.open(self.mri_lmdb_dir, readonly=True, lock=False, readahead=False, meminit=False)        
         self.mris = self.env.begin(buffers=True)
-        # with self.env.begin(write=False) as txn:
-            # self.mri_ids = [key.decode('ascii') for key, _ in txn.cursor()]
-
-        # self.mri_ids.sort()
-        # return self.mri_ids
     
     def __getitem__(self, idx):
         wsi_id, us_id, mri_id = self.cat_ids.iloc[idx]
@@ -335,21 +337,28 @@ class MineDataset(Dataset):
             us_processed_images = torch.zeros(self.us_N, *self.us_target_size)
 
         # 病理
+        wsi_coord = None
         if isinstance(wsi_id, str):
-            wsi_feat = torch.load(self.wsi_path[wsi_id])
+            if self.use_wsi_coord:
+                h5_file = h5py.File(self.wsi_path[wsi_id].replace('pt_files', 'h5_files').replace('.pt', '.h5'), 'r')
+                wsi_feat = torch.from_numpy(h5_file['features'][()])
+                wsi_coord = torch.from_numpy(h5_file['coords'][()])
+                h5_file.close()
+            else:
+                wsi_feat = torch.load(self.wsi_path[wsi_id])
         else:
-            wsi_feat = torch.zeros(1, 768)  # 768 是哪个模型的特征长度
+            wsi_feat = torch.zeros(0)  # raise ValueError
 
         # 文本, 文本模态是必须存在的, 因为要知道它的标签
         lab_tumorcls3, lab_idh3, lab_1p19q = self.df.loc[unnan_id[0], ['tumorcls3', 'idh', '1p/19q']]
-        tumorcls_desc = random.sample(self.raw_text[lab_tumorcls3], 1)[0]
-        tumorcls_text = tokenize([_preprocess_text(tumorcls_desc)], context_length=self.max_txt_length)[0]
-        eos_index = tumorcls_text.numpy().tolist().index(_tokenizer.vocab['[SEP]'])
+        tumorcls_desc = random.sample(self.raw_text[lab_tumorcls3], 1)[0]   # Todo: 增加其他文本内容
+        # tumorcls_text = tokenize([_preprocess_text(tumorcls_desc)], context_length=self.max_txt_length)[0]
+        # eos_index = tumorcls_text.numpy().tolist().index(_tokenizer.vocab['[SEP]'])
     
         return {"case_id": [wsi_id, us_id, mri_id], "label": [lab_tumorcls3, lab_idh3, lab_1p19q],
                 "data_mri": mri_data, "mri_modality": [t1c, flair],
                 'data_us_seq': sequences, 'data_us': us_processed_images,
-                'data_wsi': wsi_feat, 'text_tumor': [tumorcls_text, eos_index]}
+                'data_wsi': wsi_feat, 'data_wsi_coord': wsi_coord, 'text_tumor': tumorcls_desc}  # 不返回文本 embedding: [tumorcls_text, eos_index]
     
     def __len__(self):
         return len(self.cat_ids) // self.batch_size * self.batch_size
@@ -381,6 +390,7 @@ def custom_collate_fn(batch):
     
     data_us = torch.from_numpy(np.stack([item['data_us'] for item in batch], axis=0))
     data_wsi = [item['data_wsi'] for item in batch]
+    data_wsi_coord = [[item['data_wsi_coord'] if 'data_wsi_coord' in item.keys() else None for item in batch]]
     text_tumor = [item['text_tumor'] for item in batch]
     
     data_us_seq = [item['data_us_seq'] for item in batch]
@@ -391,14 +401,15 @@ def custom_collate_fn(batch):
     mri_modality_collated = [list(x) for x in zip(*mri_modality)]
     
     # Collate text_tumor, assuming it is a list of (feature_vector, int)
-    text_tumor_features = torch.stack([item[0] for item in text_tumor], dim=0)
-    text_tumor_indices = torch.tensor([item[1] for item in text_tumor])
+    # text_tumor_features = torch.stack([item[0] for item in text_tumor], dim=0)    # note: 弃用
+    # text_tumor_indices = torch.tensor([item[1] for item in text_tumor])
+    text = [item['text_tumor'] for item in batch]
     
     return {
         'case_id': case_ids_collated, 'label': labels_collated,
         'data_mri': data_mri, 'mri_modality': mri_modality_collated,
         'data_us_seq': data_us_seq, 'data_us': data_us,
-        'data_wsi': data_wsi, 'text_tumor': (text_tumor_features, text_tumor_indices),
+        'data_wsi': data_wsi, 'data_wsi_coord': data_wsi_coord, 'text_tumor': text, # (text_tumor_features, text_tumor_indices)
     }
 
 
@@ -424,7 +435,7 @@ class DataInfo:
     epoch_id: int
 
 
-def get_dataset(args, is_train, max_txt_length=64, epoch_id=0, mine=True):
+def get_dataset(args, is_train, max_txt_length=64, epoch_id=0, mine=True, use_wsi_coord=False):
     if is_train:
         db_path = args.train_data
     else:
@@ -442,7 +453,7 @@ def get_dataset(args, is_train, max_txt_length=64, epoch_id=0, mine=True):
                               split="train" if is_train else "val", max_txt_length=max_txt_length, 
                               use_augment=False, resolution=fetch_resolution(args.vision_model), 
                               transform_3d='default', transform_2d=None, train_ratio=0.85,
-                              us_N=args.us_N, us_target_size=(224, 224), mri_targetsize=(224, 224, 224), seed=42, batch_size=batch_size) # 128, 128, 128
+                              us_N=args.us_N, us_target_size=(224, 224), mri_targetsize=(224, 224, 224), seed=42, batch_size=batch_size, use_wsi_coord=use_wsi_coord) # 128, 128, 128
         
         num_samples, dataset.dataset_len = [len(dataset)] * 2
         pad_dataset(dataset, global_batch_size)
@@ -486,24 +497,86 @@ def get_dataset(args, is_train, max_txt_length=64, epoch_id=0, mine=True):
     return DataInfo(dataloader, sampler, dataset, epoch_id)
 
 
-def get_data(args, epoch_id=0, max_txt_length=64, is_mine=True):
+def get_dataset_singleGPU(args, is_train, max_txt_length=64, epoch_id=0, mine=True, use_wsi_coord=False):
+    if is_train:
+        db_path = args.train_data
+    else:
+        db_path = args.val_data
+    assert db_path is not None
+
+    # 单机版本，直接使用指定的batch_size
+    batch_size = args.batch_size if is_train else args.valid_batch_size
+
+    if mine:
+        dataset = MineDataset(mri_lmdb_dir='/database/wuyonghuang/WSA/medical_data_lmdb', 
+                              us_root_dir='/database/wuyonghuang/WSA/mine_task/US_PNG', 
+                              split="train" if is_train else "val", max_txt_length=max_txt_length, 
+                              use_augment=False, resolution=fetch_resolution(args.vision_model), 
+                              transform_3d='default', transform_2d=None, train_ratio=0.85,
+                              us_N=args.us_N, us_target_size=(224, 224), mri_targetsize=(224, 224, 224), 
+                              seed=42, batch_size=batch_size, use_wsi_coord=use_wsi_coord,
+                              id_files=args.id_files)
+        
+        num_samples, dataset.dataset_len = [len(dataset)] * 2
+        # 不需要pad了，因为不需要考虑分布式的global batch size
+    else:
+        dataset = LMDBDataset(
+            db_path, 
+            split="train" if is_train else "val",
+            max_txt_length=max_txt_length,
+            use_augment=args.use_augment if is_train else False,
+            resolution=fetch_resolution(args.vision_model),
+        )
+        num_samples = dataset.dataset_len
+
+    # 使用普通的RandomSampler替代DistributedSampler
+    if is_train:
+        sampler = torch.utils.data.RandomSampler(dataset)
+    else:
+        # 验证集也使用随机采样，但是固定种子以保持一致性
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+        sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        pin_memory=False,
+        num_workers=args.num_workers if is_train else args.valid_num_workers,
+        sampler=sampler,
+        collate_fn=custom_collate_fn if mine else None
+    )
+            
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = num_samples // batch_size
+    
+    # 创建一个简单的DataInfo对象，保持接口一致
+    return DataInfo(dataloader, sampler, dataset, epoch_id)
+
+
+def get_data(args, epoch_id=0, max_txt_length=64, is_mine=True, use_wsi_coord=False, single_version=False):
     data = {}
 
+    if single_version:
+        get_dataset_func = get_dataset_singleGPU
+    else:
+        get_dataset_func = get_dataset
+
     if args.train_data:
-        data["train"] = get_dataset(
+        data["train"] = get_dataset_func(
             args, 
             is_train=True,  
             max_txt_length=max_txt_length, 
-            epoch_id=epoch_id, mine=is_mine)
+            epoch_id=epoch_id, mine=is_mine, use_wsi_coord=use_wsi_coord)
 
     if args.val_data:
-        data["val"] = get_dataset(
+        data["val"] = get_dataset_func(
             args, 
             is_train=False, 
             max_txt_length=max_txt_length, 
-            epoch_id=epoch_id, mine=is_mine)
+            epoch_id=epoch_id, mine=is_mine, use_wsi_coord=use_wsi_coord)
 
-    return data
+    return data # isinstanse(data['train'].dataset, MineDataset)
 
 
 if __name__ == '__main__':
@@ -557,13 +630,17 @@ if __name__ == '__main__':
 
     'label'      : [['glioblastoma', 'glioblastoma'], ['IDH wild type', 'IDH wild type'], ['无共缺失', '无共缺失']],
 
+    'mri_modality': [[False, False], [True, False]] # 表示对于t1c和flair两种模态, 每个病人中是否出现了缺失, 第一个list中为 [False, False], 说明第一个病人缺失了这两种模态数据
+
     'data_mri'   : {'T1c': torch.randn(B, 64, 64, 64), 'Flair': torch.randn(B, 64, 64, 64)}
 
-    'data_us_seq': [...]    # 暂时不考虑这个
+    'data_us_seq': [{'seq1_id1': [seq1_id1_path1, seq1_id1_path2], {'seq1_id2': [seq1_id2_path1, seq1_id2_path2]}, ...},  {'seq2_id1': [seq2_id1_path1, seq2_id1_path1], {'seq2_id2': [seq2_id2_path1, seq2_id2_path2]}, ...}]    # 暂时不考虑这个
 
     'data_us'    : torch.randn(B, 2, 256, 256), 
 
     'data_wsi'   : [torch.Size([N1, 768]), torch.Size([N2, 768])]
+
+    'data_wsi_coord': [ [torch.Size([N1, 2]), torch.Size([N2, 2])] ]
 
     'text_tumor' : (torch.randn(B, 64), torch.randint(100, size=(B,)) )
 
