@@ -166,7 +166,7 @@ class TumorClassifier(nn.Module):
 
         return model.apply(init_weights)
 
-    def forward(self, mri_data, us_data, wsi_data, mri_flags, us_available_flags, text_data=None):
+    def forward(self, mri_data, us_data, wsi_data, mri_flags, us_available_flags, text_data=None, align_loss=None):
         mri_available_flags, mri2_flags = mri_flags
         # mri_data: (B, 2, 64, 64, 64) - T1c and Flair concatenated or handled
         # us_data: (B, 2, 256, 256)
@@ -240,6 +240,15 @@ class TumorClassifier(nn.Module):
         us_logits = self.us_classifier_head(us_features)
 
         other_results_dict = {}
+
+        if align_loss is not None:
+            align_loss = F.mse_loss(us_features, fused_features.detach())
+            other_results_dict.update({
+                'align_loss': align_loss
+            })
+        else:
+            other_results_dict.update({'align_loss': None})
+
         if self.multi_task:
             logits2 = self.classifier_head2(fused_features) # (B, num_classes)
             us_logits2 = self.us_classifier_head2(us_features)
@@ -303,7 +312,7 @@ if __name__ == '__main__':
     args.reduction = 'attention'
     args.task_wegiht = 1.
     args.ckpt = '/database/wuyonghuang/WSA/results/test1/tumor_classifier_mri_us_epoch15_all-0.812_us-0.812.pth'
-    args.tune_mode = ['classifier']  # 'all' ['clip_encoder' 'us_sam_encoder' 'mri_sam_encoder' 'wsi_encoder' 'classifier']
+    args.tune_mode = ['classifier', 'us_sam_encoder']  # 'all' ['clip_encoder' 'us_sam_encoder' 'mri_sam_encoder' 'wsi_encoder' 'classifier']
 
     device = 'cuda'
     batchsize = 2
@@ -440,14 +449,17 @@ if __name__ == '__main__':
                             wsi_data=wsi_input, 
                             mri_flags=(mri_available_flags, t1c_flair_available_flags), 
                             us_available_flags=us_available_flags,
-                            text_data=i_data['text_tumor'])
+                            text_data=i_data['text_tumor'], align_loss=True)
             loss11 = criterion(logits1, tumor_labels_int)
             loss12 = criterion(us_logits1, tumor_labels_int)
 
             loss = loss11 + loss12
-
             writer.add_scalar('Loss/loss1', loss11.item(), global_step)
             writer.add_scalar('Loss/loss2', loss12.item(), global_step)
+
+            if other_dict.get('align_loss') is not None:
+                loss += other_dict['align_loss']
+                writer.add_scalar('Loss/align_loss', other_dict['align_loss'].item(), global_step)
 
             if len(other_dict) != 0:
                 loss21 = criterion(other_dict['logits2'], idh_labels_int)
