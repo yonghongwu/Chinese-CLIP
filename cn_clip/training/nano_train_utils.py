@@ -17,7 +17,7 @@ def count_parameters(model):
     print(f"总参数量（Total parameters）: {total:,}")
     print(f"可训练参数量（Trainable parameters）: {trainable:,}")
     print(f"冻结参数量（Frozen parameters）: {total - trainable:,}")
-    print(f"训练参数比例为:{trainable / total:.2f}")
+    print(f"训练参数比例为:{trainable / total:.4f}")
 
 
 class UNet3DEncoder(nn.Module):

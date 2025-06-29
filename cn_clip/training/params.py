@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument(
         "--train-data",
         type=str,
-        required=True,
+        required=False,
         help="Path to the LMDB directory with training data split",
     )
     parser.add_argument(
@@ -194,7 +194,7 @@ def parse_args():
         help="whether to aggregate features across gpus before computing the loss"
     )
     parser.add_argument(
-        "--debug",
+        "--debug", "-d",
         default=False,
         action="store_true",
         help="If true, more information is logged."
@@ -224,6 +224,17 @@ def parse_args():
         default=0.5,
         help="Weight of KD loss."
     )
+    parser.add_argument(
+        "--us_N",
+        type=int,
+        default=2,
+        help=""
+    )
+    parser.add_argument(
+        "--use_wsi_coord",
+        default=False,
+        action="store_true",
+    )
     args = parser.parse_args()
     args.aggregate = not args.skip_aggregate
 
@@ -232,5 +243,40 @@ def parse_args():
     for name, val in default_params.items():
         if getattr(args, name) is None:
             setattr(args, name, val)
-
+    
+    input_params = {
+                'gpus_per_node': 1,
+                'worker_cnt': 1,
+                'master_addr': 'localhost',
+                'master_port': 8514,
+                'rank': 0,
+                'train_data': '/database/wuyonghuang/WSA/datapath/datasets/MUGE/lmdb/train',
+                'val_data': '/database/wuyonghuang/WSA/datapath/datasets/MUGE/lmdb/valid',
+                'resume': '/database/wuyonghuang/WSA/datapath/pretrained_weights/clip_cn_vit-b-16.pt',
+                'reset_data_offset': True,
+                'reset_optimizer': True,
+                'output_base_dir': '/database/wuyonghuang/WSA/datapath/experiments',
+                'name': 'muge_finetune_vit-b-16_roberta-base_bs128_8gpu',
+                'save_step_frequency': 999999,
+                'save_epoch_frequency': 1,
+                'log_interval': 1,
+                'report_training_batch_acc': True,
+                'context_length': 52,
+                'warmup': 100,
+                'batch_size': 4,
+                'valid_batch_size': 4,
+                'accum_freq': 1,
+                'lr': 5e-5 * 10,
+                'wd': 0.001,
+                'max_epochs': 50,
+                'valid_step_interval': 150,
+                'valid_epoch_interval': 1,
+                'vision_model': 'ViT-B-16',
+                'text_model': 'RoBERTa-wwm-ext-base-chinese',
+                'use_augment': True,
+                'us_N': 2   # note: 
+    }
+    for key, value in input_params.items():
+        setattr(args, key, value)
+    
     return args

@@ -17,6 +17,7 @@ from einops import rearrange
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
 from cn_clip.training.data import get_data
 from cn_clip.training.data import custom_collate_fn
@@ -36,6 +37,13 @@ class TumorClassifier(nn.Module):
         # self.mri_encoder = UNet3DEncoder(in_channels=2, out_features=mri_feature_dim) # 2 channels for T1c and Flair
         # self.us_encoder = UNet2DEncoder(in_channels=2, out_features=us_feature_dim)   # 2 channels for US data
 
+        self.multi_task = True if isinstance(num_classes, list) else False
+        if isinstance(num_classes, int):
+            num_classes_task1 = num_classes
+        elif isinstance(num_classes, list) and len(num_classes) == 3:
+            num_classes_task1, num_classes_task2, num_classes_task3 = num_classes
+        else: raise ValueError('num_classes must be an integer or a list of integers')
+
         self.reduction = reduction
         if self.reduction == 'attention':
             # 使 mri_feature_dim == us_feature_dim
@@ -46,19 +54,21 @@ class TumorClassifier(nn.Module):
             )
             self.out_dim = mri_feature_dim
 
-        elif self.reduction == 'concat':
-            fusion_dim = mri_feature_dim + us_feature_dim
-            self.out_dim = fusion_dim
+        elif self.reduction == 'avg':
+            # fusion_dim = mri_feature_dim + us_feature_dim
+            self.out_dim = mri_feature_dim
             
         else:
-            raise ValueError("Invalid reduction method. Choose 'attention' or 'concat'.")
+            raise ValueError("Invalid reduction method. Choose 'attention' or 'avg'.")
+
+        self.clip_encoder, self.us_preprocess = self.build_biomedclip()
 
         self.build_2d_sam = build_2d_sam
         if self.build_2d_sam:
             self.us_sam_encoder = self.build_sam2d()
             self.us_target_size = (256, 256)
         else:
-            self.us_sam_encoder, self.us_preprocess = self.build_biomedclip()
+            self.us_sam_encoder = self.clip_encoder
             self.us_target_size = (224, 224)
 
         self.mri_sam_encoder = self.build_sam3d()
@@ -68,7 +78,40 @@ class TumorClassifier(nn.Module):
                 nn.Linear(self.out_dim, self.out_dim // 2),
                 nn.ReLU(),
                 nn.Dropout(0.5),
-                nn.Linear(self.out_dim // 2, num_classes)
+                nn.Linear(self.out_dim // 2, num_classes_task1)   # 肿瘤的类别： 3
+            )
+        
+        self.us_classifier_head = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(self.out_dim // 2, num_classes_task1)
+            )
+        
+        if self.multi_task:
+            self.classifier_head2 = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(self.out_dim // 2, num_classes_task2)             # idh的类别： 2
+            )
+            self.classifier_head3 = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(self.out_dim // 2, num_classes_task2)             # 1p19q的类别： 2
+            )
+            self.us_classifier_head2 = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(self.out_dim // 2, num_classes_task3)
+            )
+            self.us_classifier_head3 = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(self.out_dim // 2, num_classes_task3)
             )
     
     def build_biomedclip(self):
@@ -146,6 +189,7 @@ class TumorClassifier(nn.Module):
         mri_features = F.adaptive_avg_pool1d(mri_features, 512)
 
         # note: 支持使用 biomedclip 来提取 us 数据
+        us_N = us_data.shape[1]
         rearrange_ada_us_data = rearrange(us_data, 'b c h w -> (b c) h w').unsqueeze(dim=1)
         rearrange_ada_us_data = F.adaptive_avg_pool2d(rearrange_ada_us_data, self.us_target_size).repeat(1, 3, 1, 1)
         if self.build_2d_sam:
@@ -154,9 +198,10 @@ class TumorClassifier(nn.Module):
             rearrange_ada_us_data = self.us_preprocess(rearrange_ada_us_data/255)
             rearrange_ada_us_feat, _, _ = self.us_sam_encoder(rearrange_ada_us_data)
 
-        us_features = rearrange(rearrange_ada_us_feat, '(b c) d -> b (c d)', c=2)   # (B, 256 * us_N)   # note: 待改进
-        if us_features.shape[-1] != 512:
-            us_features = F.adaptive_avg_pool1d(us_features, 512)
+        # us_features = rearrange(rearrange_ada_us_feat, '(b c) d -> b (c d)', c=2)   # (B, 256 * us_N)   # note: 待改进
+        us_features = torch.mean(rearrange(rearrange_ada_us_feat, '(b c) d -> b c d', c=us_N), dim=1)
+        # if us_features.shape[-1] != 512:
+        #     us_features = F.adaptive_avg_pool1d(us_features, 512)
         
         mri_available_flags = torch.tensor(mri_available_flags, device=device, dtype=torch.bool)  # (B,)
         mri_features = mri_features * mri_available_flags.unsqueeze(1)  # 广播操作
@@ -166,21 +211,50 @@ class TumorClassifier(nn.Module):
         wsi_features_lst = [self.wsi_encoder(i) if len(i)!=0 else torch.zeros(1, 512).to(device) for i in wsi_data]
         wsi_features = torch.concat(wsi_features_lst, dim=0)  # stack
 
-        # note: 通道融合
+        if text_data is not None:
+            text_emb = self.tokenizer(text_data, context_length=256).to(device)
+            _, text_feat, logit_scale = self.clip_encoder(None, text_emb)
+            if text_feat.shape[-1] != 512:
+                text_feat = F.adaptive_avg_pool1d(text_feat, 512)
+
         if self.reduction == 'attention':
-            fused_features = torch.stack((mri_features, us_features, wsi_features), dim=1)  # (B, 3, 512)
+            if text_data is not None:
+                fused_features = torch.stack((mri_features, us_features, wsi_features, text_feat), dim=1)  # (B, 3, 512)
+            else:
+                fused_features = torch.stack((mri_features, us_features, wsi_features), dim=1)  # (B, 3, 512)
+
             attn_weights = self.attention(fused_features)  # (B, C, 1)
             attn_weights = F.softmax(attn_weights, dim=1)  # (B, C, 1)
             fused_features = torch.sum(fused_features * attn_weights, dim=1)  # (B, D)
-            # logits = self.classifier(x)  # (B, num_classes)
 
-        elif self.reduction == 'concat':
+        elif self.reduction == 'avg':
+            if text_data is not None:
+                fused_features = torch.stack((mri_features, us_features, wsi_features, text_feat), dim=1)  # (B, 3, 512)
+            else:
+                fused_features = torch.stack((mri_features, us_features, wsi_features), dim=1)  # (B, 3, 512)
+
             # 特征拼接
-            fused_features = torch.cat((mri_features, us_features), dim=1) # (B, fusion_dim)
+            fused_features = torch.mean(fused_features, dim=1)
         
         logits = self.classifier_head(fused_features) # (B, num_classes)
+        us_logits = self.us_classifier_head(us_features)
 
-        return logits
+        other_results_dict = {}
+        if self.multi_task:
+            logits2 = self.classifier_head2(fused_features) # (B, num_classes)
+            us_logits2 = self.us_classifier_head2(us_features)
+
+            logits3 = self.classifier_head3(fused_features) # (B, num_classes)
+            us_logits3 = self.us_classifier_head3(us_features)
+
+            # 将四个logits放进 dict中
+            other_results_dict.update({
+                'logits2': logits2,
+                'us_logits2': us_logits2,
+                'logits3': logits3,
+                'us_logits3': us_logits3
+            })
+        return logits, us_logits, other_results_dict
 
 
 def get_mri_data(data, mri_modality='T1c', batchsize=1, batch_available_flags=None):
@@ -224,15 +298,26 @@ if __name__ == '__main__':
     # 将args2更新到 args中
     args.__dict__.update(args2.__dict__)
 
+    # 新的参数设置
+    args.num_classes = [3, 2, 2]
+    args.reduction = 'attention'
+    args.task_wegiht = 1.
+    args.ckpt = '/database/wuyonghuang/WSA/results/test1/tumor_classifier_mri_us_epoch15_all-0.812_us-0.812.pth'
+    args.tune_mode = ['classifier']  # 'all' ['clip_encoder' 'us_sam_encoder' 'mri_sam_encoder' 'wsi_encoder' 'classifier']
+
+    device = 'cuda'
+    batchsize = 2
+    num_epochs = 100 # Example
+
     if args.debug:
-        snap_dir = os.path.join('/database/wuyonghuang/WSA', 'debug')
+        snap_dir = os.path.join('/database/wuyonghuang/WSA', 'results', 'debug')
     else:
-        snap_dir = os.path.join('/database/wuyonghuang/WSA', args.exp_name)
+        snap_dir = os.path.join('/database/wuyonghuang/WSA', 'results', args.exp_name)
     
     if not os.path.exists(snap_dir):
         os.makedirs(snap_dir)
-
-    batchsize = 2
+    
+    writer = SummaryWriter(log_dir=snap_dir)
 
     tumor_label_map = {'glioblastoma': 0, 'astrocytoma': 1, 'oligodendroglioma': 2}    
     num_tumor_classes = len(tumor_label_map)
@@ -256,44 +341,62 @@ if __name__ == '__main__':
                 collate_fn=custom_collate_fn
             )
 
-    device = 'cuda'
-    model = TumorClassifier(build_2d_sam=False) # 意味着使用 biomed_clip 而不是 sam2d
+    model = TumorClassifier(mri_feature_dim=512, us_feature_dim=512, num_classes=args.num_classes, reduction=args.reduction, build_2d_sam=False) # 意味着使用 biomed_clip 而不是 sam2d
+    
+    if args.ckpt is not None:
+        model.load_state_dict(torch.load(args.ckpt), strict=False)
 
-    def nan_hook(module, input, output):
-        if isinstance(output, torch.Tensor):
-            if torch.isnan(output).any():
-                print(f"NaN detected in {module.__class__.__name__}")
-                raise RuntimeError("NaN detected")
+    if not args.debug:
+        def nan_hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                if torch.isnan(output).any():
+                    print(f"NaN detected in {module.__class__.__name__}")
+                    raise RuntimeError("NaN detected")
 
-    # 为所有层添加钩子
-    for name, module in model.named_modules():
-        module.register_forward_hook(nan_hook)
+        # 为所有层添加钩子
+        for name, module in model.named_modules():
+            module.register_forward_hook(nan_hook)
 
-    model = torch.nn.DataParallel(model)
+    # model = torch.nn.DataParallel(model)
     model.cuda()
 
-    # mri_sam_encoder_length = len(list(model.mri_sam_encoder.parameters()))
-    # for idx, param in enumerate(model.mri_sam_encoder.parameters()):
-    #     if mri_sam_encoder_length - idx >= 20:
-    #         param.requires_grad = False
+    if args.tune_mode == 'all':
+        print(f"Total parameters: {count_parameters(model)}")
 
-    # mri_us_encoder_length = len(list(model.us_sam_encoder.parameters()))
-    # for idx, param in enumerate(model.us_sam_encoder.parameters()):
-    #     if mri_us_encoder_length - idx >= 20:
-    #         param.requires_grad = False
+    elif isinstance(args.tune_mode, list):
+        for name, param in model.named_parameters():
+            if name.split('.')[0] in args.tune_mode:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+            if 'classifier' in args.tune_mode and 'classifier' in name:
+                param.requires_grad = True
+
+    else: raise ValueError("tune_mode should be 'all' or a list of indices")
+
+    count_parameters(model)
 
     # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     criterion = torch.nn.functional.cross_entropy
 
-    num_epochs = 100 # Example
-    best_accuracy = 0.
+    best_accuracy1, best_us_accuracy1 = 0., 0.
+    best_accuracy2, best_us_accuracy2 = 0., 0.
+    best_accuracy3, best_us_accuracy3 = 0., 0.
+
+    global_step = 0  # 用于记录全局步骤
     scaler = GradScaler()
 
     for epoch in range(num_epochs):
         total_loss = 0
-        correct_predictions = 0
-        total_samples = 0
+        correct_predictions1, us_correct_predictions1 = 0, 0
+        correct_predictions2, us_correct_predictions2 = 0, 0
+        correct_predictions3, us_correct_predictions3 = 0, 0
+
+        total_tumor_samples, total_idh_samples, total_pq_samples = 0, 0, 0
+
+        epoch_loss1 = 0.0
+        epoch_loss2 = 0.0
 
         for batch_idx, i_data in tqdm(enumerate(dataloader), desc='Training'):
             model.train()
@@ -306,7 +409,6 @@ if __name__ == '__main__':
             mri_input = process_mri_data(i_data, batchsize, device=device)
             us_input = i_data['data_us'].to(device) # (B, 2, 256, 256)
             wsi_input = [i.to(device) for i in i_data['data_wsi']]
-            text_input = model.tokenizer(i_data['text_tumor'], context_length=256).to(device)
 
             # Availability flags (check 'case_id' for nan)
             # case_id: [['wsi_id1', 'wsi_id2'], ['us_id1', 'us_id2'], ['mri_id1', 'mri_id2']]
@@ -332,29 +434,50 @@ if __name__ == '__main__':
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.zero_grad()
 
-            with autocast():
-                logits = model(mri_data=mri_input, 
-                               us_data=us_input.float(), 
-                               wsi_data=wsi_input, 
-                               mri_flags=(mri_available_flags, t1c_flair_available_flags), 
-                               us_available_flags=us_available_flags,
-                               text_data=None)
-                loss = criterion(logits, tumor_labels_int)
+            # with autocast():
+            logits1, us_logits1, other_dict = model(mri_data=mri_input, 
+                            us_data=us_input.float(), 
+                            wsi_data=wsi_input, 
+                            mri_flags=(mri_available_flags, t1c_flair_available_flags), 
+                            us_available_flags=us_available_flags,
+                            text_data=i_data['text_tumor'])
+            loss11 = criterion(logits1, tumor_labels_int)
+            loss12 = criterion(us_logits1, tumor_labels_int)
 
-                # 检查loss
-                if torch.isnan(loss):
-                    print(f"NaN loss at batch {batch_idx}")
-                    print(f"mri_input stats: min={mri_input.min()}, max={mri_input.max()}")
-                    print(f"us_input stats: min={us_input.min()}, max={us_input.max()}")
-                    print(f"wsi_input stats: min={min([i.min() for i in wsi_input])}, max={max([i.max() for i in wsi_input])}")
-                    print(f"Output stats: min={logits.min()}, max={logits.max()}")
-                    break
+            loss = loss11 + loss12
+
+            writer.add_scalar('Loss/loss1', loss11.item(), global_step)
+            writer.add_scalar('Loss/loss2', loss12.item(), global_step)
+
+            if len(other_dict) != 0:
+                loss21 = criterion(other_dict['logits2'], idh_labels_int)
+                loss22 = criterion(other_dict['us_logits2'], idh_labels_int)
+                loss31 = criterion(other_dict['logits3'], pq_labels_int)
+                loss32 = criterion(other_dict['us_logits3'], pq_labels_int)
+
+                loss += args.task_wegiht * (loss21 + loss22 + loss31 + loss32)
+
+                writer.add_scalar('Loss/loss21', loss21.item(), global_step)
+                writer.add_scalar('Loss/loss22', loss22.item(), global_step)
+                writer.add_scalar('Loss/loss31', loss31.item(), global_step)
+                writer.add_scalar('Loss/loss32', loss32.item(), global_step)
+
+            global_step += 1  # 更新全局步骤
+
+            # 检查loss
+            if torch.isnan(loss):
+                print(f"NaN loss at batch {batch_idx}")
+                print(f"mri_input stats: min={mri_input.min()}, max={mri_input.max()}")
+                print(f"us_input stats: min={us_input.min()}, max={us_input.max()}")
+                print(f"wsi_input stats: min={min([i.min() for i in wsi_input])}, max={max([i.max() for i in wsi_input])}")
+                print(f"Output stats: min={logits1.min()}, max={us_logits1.max()}")
+                break
 
             # --- 5. Backward pass and optimize ---
-            # loss.backward()
-            # optimizer.step()
+            loss.backward()
+            optimizer.step()
             # 缩放损失，反向传播
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
 
             # 检查梯度
             total_norm = 0
@@ -367,18 +490,31 @@ if __name__ == '__main__':
                 print(f"Large gradient norm: {total_norm}")
 
             # 更新参数
-            scaler.step(optimizer)
-            # 更新缩放器
-            scaler.update()
+            # scaler.step(optimizer)
+            # # 更新缩放器
+            # scaler.update()
             
             # --- 6. Logging ---
             total_loss += loss.item()
-            _, predicted_classes = torch.max(logits, 1)
+            _, predicted_classes = torch.max(logits1, 1)
+            _, us_predicted_classes = torch.max(us_logits1, 1)
+
             # correct_predictions += (predicted_classes == tumor_labels_int).sum().item()
             # total_samples += tumor_labels_int.size(0)
 
-            print(f"Epoch {epoch}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
-        
+            if len(other_dict) == 0:
+                print(f"Epoch {epoch}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}, Loss1: {loss11.item():.4f}, Loss2: {loss12.item():.4f}")
+            else:
+                print(f"Epoch {epoch}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}, \
+                      loss11: {loss11.item():.4f}, loss12: {loss12.item():.4f}, \
+                      Loss21: {loss21.item():.4f}, Loss22: {loss22.item():.4f}, \
+                      Loss31: {loss31.item():.4f}, Loss32: {loss32.item():.4f}, ")
+            
+            if args.debug and batch_idx == 2:
+                break
+        if args.debug:
+            break
+
         with torch.no_grad():
             model.eval()
             for batch_idx, i_data in tqdm(enumerate(val_dataloader), desc='Validation'):
@@ -396,19 +532,96 @@ if __name__ == '__main__':
                 tumor_labels_str = i_data['label'][0]
                 tumor_labels_int = torch.tensor([tumor_label_map[label] for label in tumor_labels_str], dtype=torch.long).to(device)
 
-                logits = model(mri_input, us_input.float(), wsi_input, (mri_available_flags, t1c_flair_available_flags), us_available_flags)
+                idh_labels_str = i_data['label'][1]
+                idh_labels_int = torch.tensor([idh_label_map[label] for label in idh_labels_str], dtype=torch.long).to(device)
+
+                pq_labels_str = i_data['label'][2]
+                pq_labels_int = torch.tensor([pq_label_map[label] for label in pq_labels_str], dtype=torch.long).to(device)
+
+                logits1, us_logits1, other_dict = model(mri_input, us_input.float(), wsi_input, (mri_available_flags, t1c_flair_available_flags), us_available_flags,
+                                                       text_data=i_data['text_tumor'])
                 
-                _, predicted_classes = torch.max(logits, 1)
-                correct_predictions += (predicted_classes == tumor_labels_int).sum().item()
-                total_samples += tumor_labels_int.size(0)
+                # 计算 肿瘤分类的 结果
+                _, predicted_classes = torch.max(logits1, 1)
+                correct_predictions1 += (predicted_classes == tumor_labels_int).sum().item()
+                _, us_predicted_classes = torch.max(us_logits1, 1)
+                us_correct_predictions1 += (us_predicted_classes == tumor_labels_int).sum().item()
+                total_tumor_samples += tumor_labels_int.size(0)
+
+                if len(other_dict) != 0 and len(args.num_classes) == 3:
+                    # 计算 idh 分类的 结果
+                    _, predicted_classes = torch.max(other_dict['logits2'], 1)
+                    correct_predictions2 += (predicted_classes == idh_labels_int).sum().item()
+                    _, us_predicted_classes = torch.max(other_dict['us_logits2'], 1)
+                    us_correct_predictions2 += (us_predicted_classes == idh_labels_int).sum().item()
+                    total_idh_samples += idh_labels_int.size(0)
+
+                    # 计算 1p19q 分类的 结果
+                    _, predicted_classes = torch.max(other_dict['logits3'], 1)
+                    correct_predictions3 += (predicted_classes == pq_labels_int).sum().item()
+                    _, us_predicted_classes = torch.max(other_dict['us_logits3'], 1)
+                    us_correct_predictions3 += (us_predicted_classes == pq_labels_int).sum().item()
+                    total_pq_samples += pq_labels_int.size(0)
 
                 print(f"Epoch {epoch}/{num_epochs}, Batch {batch_idx}/{len(val_dataloader)}")
-
+                if args.debug and batch_idx > 5:
+                    break
+        
         avg_epoch_loss = total_loss / len(dataloader)
-        epoch_accuracy = correct_predictions / total_samples
-        print(f"Epoch {epoch} Summary: Avg Loss: {avg_epoch_loss:.4f}, Val_Accuracy: {epoch_accuracy:.4f}")
+        epoch_accuracy1 = correct_predictions1 / total_tumor_samples
+        epoch_us_accuracy1 = us_correct_predictions1 / total_tumor_samples
+        
+        if isinstance(args.num_classes, list):
+            epoch_accuracy2 = correct_predictions2 / total_idh_samples
+            epoch_us_accuracy2 = us_correct_predictions2 / total_idh_samples
+
+            epoch_accuracy3 = correct_predictions3 / total_pq_samples
+            epoch_us_accuracy3 = us_correct_predictions3 / total_pq_samples
+            print(f"Epoch {epoch} Summary: Avg Loss: {avg_epoch_loss:.4f}, \
+                  Val_all_Accuracy1: {epoch_accuracy1:.4f}, Val_us_Accuracy1: {epoch_us_accuracy1:.4f}, \
+                  Val_all_Accuracy2: {epoch_accuracy2:.4f}, Val_us_Accuracy2: {epoch_us_accuracy2:.4f}, \
+                  Val_all_Accuracy3: {epoch_accuracy3:.4f}, Val_us_Accuracy3: {epoch_us_accuracy3:.4f}, ")
+        else:
+            print(f"Epoch {epoch} Summary: Avg Loss: {avg_epoch_loss:.4f}, Val_all_Accuracy: {epoch_accuracy1:.4f}, Val_us_Accuracy: {epoch_us_accuracy1:.4f}")
+
         # 根据 epoch_accuracy 写earlystop, 当指标更好的时候就 保存模型
-        if epoch_accuracy > best_accuracy:
-            best_accuracy = epoch_accuracy
+        is_save1, is_save2 = False, False
+        if epoch_accuracy1 > best_accuracy1:
+            best_accuracy1 = epoch_accuracy1
+            is_save1 = True
+        
+        if epoch_us_accuracy1 > best_us_accuracy1:
+            best_us_accuracy1 = epoch_us_accuracy1
+            is_save2 = True
+        
+        if is_save1 or is_save2:
             torch.save(model.state_dict(), 
-                       os.path.join(snap_dir, f"tumor_classifier_mri_us_epoch{epoch}_{epoch_accuracy:.03f}.pth"))
+                os.path.join(snap_dir, f"tumor_cls_epoch{epoch}_all-{epoch_accuracy1:.03f}_us-{epoch_us_accuracy1:.03f}.pth"))
+        
+        is_save1, is_save2 = False, False
+        if epoch_accuracy2 > best_accuracy2:
+            best_accuracy2 = epoch_accuracy2
+            is_save1 = True
+        
+        if epoch_us_accuracy2 > best_us_accuracy2:
+            best_us_accuracy2 = epoch_us_accuracy2
+            is_save2 = True
+        
+        if is_save1 or is_save2:
+            torch.save(model.state_dict(), 
+                os.path.join(snap_dir, f"idh_cls_epoch{epoch}_all-{epoch_accuracy2:.03f}_us-{epoch_us_accuracy2:.03f}.pth"))
+        
+        is_save1, is_save2 = False, False
+        if epoch_accuracy3 > best_accuracy3:
+            best_accuracy3 = epoch_accuracy3
+            is_save1 = True
+        
+        if epoch_us_accuracy3 > best_us_accuracy3:
+            best_us_accuracy3 = epoch_us_accuracy3
+            is_save2 = True
+        
+        if is_save1 or is_save2:
+            torch.save(model.state_dict(), 
+                os.path.join(snap_dir, f"pq_cls_epoch{epoch}_all-{epoch_accuracy3:.03f}_us-{epoch_us_accuracy3:.03f}.pth"))
+
+    writer.close()
